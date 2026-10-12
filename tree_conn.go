@@ -203,9 +203,13 @@ func treeConnect(ctx context.Context, s *session, path string, flags uint16, mc 
 		Mapping: mc,
 	}
 
-	req.CreditCharge = 1
+	var err error
+	req.CreditCharge, _, err = s.borrowCredits(ctx, 0)
+	if err != nil {
+		return nil, err
+	}
 
-	rr, err := s.send(ctx, req)
+	rr, err := s.sendWith(ctx, req, nil, req.CreditCharge)
 	if err != nil {
 		return nil, err
 	}
@@ -284,9 +288,8 @@ func (tc *treeConn) sendRecv(ctx context.Context, cmd uint16, req smb2.Packet) (
 // sendRecvUnborrowed is sendRecv for a request whose CreditCharge was not drawn
 // from the account.
 func (tc *treeConn) sendRecvUnborrowed(ctx context.Context, cmd uint16, req smb2.Packet) (res []byte, err error) {
-	// A 0 loan: nothing was borrowed, so a failure refunds nothing. The cost is
-	// that the response's grant is banked against a debt the account never
-	// incurred, inflating the balance by one credit per such request.
+	// A 0 loan: nothing was borrowed, so a failure refunds nothing, and the
+	// response's grant pays for the request's charge before the rest is banked.
 	rr, err := tc.sendWith(ctx, req, tc, 0)
 	if err != nil {
 		return nil, err

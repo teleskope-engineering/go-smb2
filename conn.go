@@ -109,9 +109,12 @@ retry:
 		return nil, err
 	}
 
-	req.CreditCharge = 1
+	req.CreditCharge, _, err = conn.borrowCredits(ctx, 0)
+	if err != nil {
+		return nil, err
+	}
 
-	rr, err := conn.send(ctx, req)
+	rr, err := conn.sendWith(ctx, req, nil, req.CreditCharge)
 	if err != nil {
 		return nil, err
 	}
@@ -240,6 +243,10 @@ type requestResponse struct {
 	msgId         uint64
 	asyncId       uint64
 	creditRequest uint16
+	// unpaid is the part of the request's CreditCharge that was not borrowed
+	// from the account. The response's grant pays it before the rest is banked.
+	// Touched only under conn.m at creation and by the receiver afterwards.
+	unpaid uint16
 	// loan is the credits borrowed from the account for this request, and zero
 	// once the request has been settled. Taken via claimLoan.
 	loan    atomic.Uint32
@@ -256,6 +263,18 @@ type requestResponse struct {
 // took it. Safe from any goroutine; only the first caller gets a nonzero value.
 func (rr *requestResponse) claimLoan() uint16 {
 	return uint16(rr.loan.Swap(0))
+}
+
+// payUnpaid pays the request's unpaid charge out of a response's grant and
+// returns the grant and credit request to settle with what is left. Banking the
+// whole grant would leave the account holding credits for window slots the
+// request already used, and a client that spends them sends MessageIds past the
+// server's window, which it answers by dropping the connection
+// (MS-SMB2 3.3.5.2.3).
+func (rr *requestResponse) payUnpaid(granted uint16) (uint16, uint16) {
+	paid := min(granted, rr.unpaid)
+	rr.unpaid -= paid
+	return granted - paid, rr.creditRequest - min(rr.creditRequest, paid)
 }
 
 // freeRecvBuf returns the pooled receive buffer, if any. Safe to call
@@ -404,9 +423,9 @@ func (conn *conn) mustSignAny(sessionFlags uint16, entries []compoundEntry) bool
 	return false
 }
 
-// send transmits a control request that did not borrow credits from the account
-// (negotiate, session setup, tree connect, echo, ...). borrowed is 0, so a
-// failure refunds nothing.
+// send transmits a request that did not borrow credits from the account. A
+// failure refunds nothing, and the response's grant pays for the request's
+// charge before the rest is banked.
 func (conn *conn) send(ctx context.Context, req smb2.Packet) (rr *requestResponse, err error) {
 	return conn.sendWith(ctx, req, nil, 0)
 }
@@ -702,11 +721,15 @@ func (conn *conn) makeRequestResponse(ctx context.Context, req smb2.Packet, tc *
 	hdr := req.Header()
 
 	var msgId uint64
+	var unpaid uint16
 
 	if _, ok := req.(*smb2.CancelRequest); !ok {
 		msgId = conn.sequenceWindow
 
 		creditCharge := hdr.CreditCharge
+		if borrowed < creditCharge {
+			unpaid = creditCharge - borrowed
+		}
 
 		conn.sequenceWindow += uint64(creditCharge)
 		if hdr.CreditRequestResponse == 0 {
@@ -767,6 +790,7 @@ func (conn *conn) makeRequestResponse(ctx context.Context, req smb2.Packet, tc *
 	rr = &requestResponse{
 		msgId:         msgId,
 		creditRequest: hdr.CreditRequestResponse,
+		unpaid:        unpaid,
 		pkt:           pkt,
 		ctx:           ctx,
 		recv:          make(chan []byte, 1),
@@ -1152,14 +1176,14 @@ func (conn *conn) tryHandle(pkt []byte, e error, rb *recvBuf) error {
 		close(rr.recv)
 	case erref.NtStatus(p.Status()) == erref.STATUS_PENDING:
 		rr.asyncId = p.AsyncId()
-		conn.account.settle(p.CreditResponse(), rr.creditRequest)
+		conn.account.settle(rr.payUnpaid(p.CreditResponse()))
 		// The response settled the loan; take it so the re-registered request
 		// is not refunded again if the caller later abandons it.
 		rr.claimLoan()
 		conn.outstandingRequests.set(msgId, rr)
 		conn.freePoolBuf(rb)
 	default:
-		conn.account.settle(p.CreditResponse(), rr.creditRequest)
+		conn.account.settle(rr.payUnpaid(p.CreditResponse()))
 		rr.claimLoan()
 
 		// Transfer ownership of the pooled receive buffer to the

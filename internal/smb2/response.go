@@ -754,7 +754,7 @@ func (c *TreeDisconnectResponse) Header() *PacketHeader {
 }
 
 func (c *TreeDisconnectResponse) Size() int {
-	return 4
+	return 64 + 4
 }
 
 func (c *TreeDisconnectResponse) Encode(pkt []byte) {

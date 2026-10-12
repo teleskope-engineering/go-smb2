@@ -40,10 +40,13 @@ func sessionSetup(ctx context.Context, conn *conn, i Initiator) (*session, error
 		req.SecurityMode = smb2.SMB2_NEGOTIATE_SIGNING_ENABLED
 	}
 
-	req.CreditCharge = 1
+	req.CreditCharge, _, err = conn.borrowCredits(ctx, 0)
+	if err != nil {
+		return nil, err
+	}
 	req.CreditRequestResponse = conn.account.initRequest()
 
-	rr, err := conn.send(ctx, req)
+	rr, err := conn.sendWith(ctx, req, nil, req.CreditCharge)
 	if err != nil {
 		return nil, err
 	}
@@ -119,9 +122,13 @@ func sessionSetup(ctx context.Context, conn *conn, i Initiator) (*session, error
 	if status == erref.STATUS_MORE_PROCESSING_REQUIRED {
 		req.SecurityBuffer = outputToken
 
+		req.CreditCharge, _, err = conn.borrowCredits(ctx, 0)
+		if err != nil {
+			return nil, err
+		}
 		req.CreditRequestResponse = 0
 
-		rr, err = s.send(ctx, req)
+		rr, err = s.sendWith(ctx, req, nil, req.CreditCharge)
 		if err != nil {
 			return nil, err
 		}
@@ -293,7 +300,10 @@ func (s *session) logoff(ctx context.Context) error {
 
 	req.CreditCharge = 1
 
-	_, err := s.sendRecv(ctx, smb2.SMB2_LOGOFF, req)
+	// Sent without borrowing, like a tree disconnect: logoff runs during
+	// teardown and must not wait on credits held by requests that may never
+	// return.
+	_, err := s.sendRecv(ctx, smb2.SMB2_LOGOFF, req, 0)
 
 	return err
 }
@@ -301,9 +311,13 @@ func (s *session) logoff(ctx context.Context) error {
 func (s *session) echo(ctx context.Context) error {
 	req := new(smb2.EchoRequest)
 
-	req.CreditCharge = 1
+	var err error
+	req.CreditCharge, _, err = s.borrowCredits(ctx, 0)
+	if err != nil {
+		return err
+	}
 
-	res, err := s.sendRecv(ctx, smb2.SMB2_ECHO, req)
+	res, err := s.sendRecv(ctx, smb2.SMB2_ECHO, req, req.CreditCharge)
 	if err != nil {
 		return err
 	}
@@ -316,8 +330,10 @@ func (s *session) echo(ctx context.Context) error {
 	return nil
 }
 
-func (s *session) sendRecv(ctx context.Context, cmd uint16, req smb2.Packet) (res []byte, err error) {
-	rr, err := s.send(ctx, req)
+// sendRecv sends req, registering borrowed as the credits drawn from the account
+// for it, and returns its accepted response payload.
+func (s *session) sendRecv(ctx context.Context, cmd uint16, req smb2.Packet, borrowed uint16) (res []byte, err error) {
+	rr, err := s.sendWith(ctx, req, nil, borrowed)
 	if err != nil {
 		return nil, err
 	}
